@@ -7,131 +7,194 @@ const cors = require("cors");
 
 const app = express();
 const server = http.createServer(app);
-
-// Configure CORS for Socket.IO
 const io = socketIo(server, {
   cors: {
-    origin: "*",
+    origin: ["http://localhost:3000", "http://localhost:3001"],
     methods: ["GET", "POST"],
-    credentials: true,
-    allowEIO3: true,
   },
 });
 
 app.use(cors());
 app.use(express.json());
 
-// Store connected users and their chat rooms
-const connectedUsers = new Map();
-const chatRooms = new Map();
-const messageHistory = new Map();
-
-// Generate unique ID
-function generateId() {
-  return Math.random().toString(36).substr(2, 9);
-}
-
-// Get all online users
-function getOnlineUsers() {
-  return Array.from(connectedUsers.values());
-}
-
-// Create or get chat room between two users
-function getChatRoomId(userId1, userId2) {
-  return [userId1, userId2].sort().join("-");
-}
+// Store connected users
+const users = new Map();
+const messages = new Map(); // Store messages for each conversation
+const typingUsers = new Map(); // Store typing status
 
 io.on("connection", (socket) => {
   console.log("User connected:", socket.id);
 
-  // Handle user joining
-  socket.on("join", ({ username }) => {
-    const user = {
-      id: socket.id,
+  // User joins with username
+  socket.on("join", (userData) => {
+    const { username, userId } = userData;
+
+    users.set(socket.id, {
+      id: userId,
       username,
+      socketId: socket.id,
       isOnline: true,
-    };
+      lastSeen: new Date(),
+    });
 
-    connectedUsers.set(socket.id, user);
+    socket.userId = userId;
+    socket.username = username;
 
-    // Send user ID back to the client
-    socket.emit("user_joined", { userId: socket.id, username });
-
-    // Broadcast updated user list to all clients
-    io.emit("users_updated", getOnlineUsers());
+    // Send updated user list to all clients
+    io.emit("users-updated", Array.from(users.values()));
 
     console.log(`${username} joined the chat`);
   });
 
-  // Handle starting a chat
-  socket.on("start_chat", ({ userId }) => {
-    const currentUser = connectedUsers.get(socket.id);
-    const targetUser = connectedUsers.get(userId);
+  // Handle private messages
+  socket.on("private-message", (data) => {
+    const { recipientId, message, timestamp, messageId } = data;
+    const sender = users.get(socket.id);
 
-    if (currentUser && targetUser) {
-      const roomId = getChatRoomId(socket.id, userId);
-
-      // Join both users to the room
-      socket.join(roomId);
-      io.sockets.sockets.get(userId)?.join(roomId);
-
-      // Send chat history if exists
-      const history = messageHistory.get(roomId) || [];
-      socket.emit("chat_history", history);
-
-      console.log(
-        `Chat started between ${currentUser.username} and ${targetUser.username}`
+    if (sender) {
+      // Find recipient socket
+      const recipientSocket = Array.from(users.entries()).find(
+        ([socketId, user]) => user.id === recipientId
       );
-    }
-  });
 
-  // Handle sending messages
-  socket.on("send_message", ({ receiverId, content }) => {
-    const sender = connectedUsers.get(socket.id);
-    const receiver = connectedUsers.get(receiverId);
+      if (recipientSocket) {
+        const [recipientSocketId] = recipientSocket;
 
-    if (sender && receiver) {
-      const roomId = getChatRoomId(socket.id, receiverId);
+        const messageData = {
+          id: messageId,
+          senderId: sender.id,
+          senderUsername: sender.username,
+          recipientId,
+          message,
+          timestamp,
+          isRead: false,
+        };
 
-      const message = {
-        id: generateId(),
-        senderId: socket.id,
-        senderName: sender.username,
-        receiverId,
-        content,
-        timestamp: new Date(),
-        isRead: false,
-      };
+        // Store message
+        const conversationKey = [sender.id, recipientId].sort().join("-");
+        if (!messages.has(conversationKey)) {
+          messages.set(conversationKey, []);
+        }
+        messages.get(conversationKey).push(messageData);
 
-      // Store message in history
-      if (!messageHistory.has(roomId)) {
-        messageHistory.set(roomId, []);
+        // Send to recipient
+        io.to(recipientSocketId).emit("private-message", messageData);
+
+        // Send confirmation to sender
+        socket.emit("message-sent", { messageId, timestamp });
       }
-      messageHistory.get(roomId).push(message);
-
-      // Send message to both users in the room
-      io.to(roomId).emit("message_received", message);
-
-      console.log(
-        `Message from ${sender.username} to ${receiver.username}: ${content}`
-      );
     }
   });
 
-  // Handle disconnection
-  socket.on("disconnect", () => {
-    const user = connectedUsers.get(socket.id);
-    if (user) {
-      console.log(`${user.username} disconnected`);
-      connectedUsers.delete(socket.id);
+  // Handle message read status
+  socket.on("mark-messages-read", (data) => {
+    const { senderId } = data;
+    const currentUser = users.get(socket.id);
 
-      // Broadcast updated user list
-      io.emit("users_updated", getOnlineUsers());
+    if (currentUser) {
+      const conversationKey = [currentUser.id, senderId].sort().join("-");
+      const conversationMessages = messages.get(conversationKey);
+
+      if (conversationMessages) {
+        conversationMessages.forEach((msg) => {
+          if (msg.recipientId === currentUser.id) {
+            msg.isRead = true;
+          }
+        });
+
+        // Notify sender that messages have been read
+        const senderSocket = Array.from(users.entries()).find(
+          ([socketId, user]) => user.id === senderId
+        );
+
+        if (senderSocket) {
+          const [senderSocketId] = senderSocket;
+          io.to(senderSocketId).emit("messages-read", {
+            readBy: currentUser.id,
+            conversationKey,
+          });
+        }
+      }
+    }
+  });
+
+  // Handle typing indicators
+  socket.on("typing-start", (data) => {
+    const { recipientId } = data;
+    const sender = users.get(socket.id);
+
+    if (sender) {
+      const recipientSocket = Array.from(users.entries()).find(
+        ([socketId, user]) => user.id === recipientId
+      );
+
+      if (recipientSocket) {
+        const [recipientSocketId] = recipientSocket;
+        io.to(recipientSocketId).emit("user-typing", {
+          userId: sender.id,
+          username: sender.username,
+        });
+      }
+    }
+  });
+
+  socket.on("typing-stop", (data) => {
+    const { recipientId } = data;
+    const sender = users.get(socket.id);
+
+    if (sender) {
+      const recipientSocket = Array.from(users.entries()).find(
+        ([socketId, user]) => user.id === recipientId
+      );
+
+      if (recipientSocket) {
+        const [recipientSocketId] = recipientSocket;
+        io.to(recipientSocketId).emit("user-stop-typing", {
+          userId: sender.id,
+        });
+      }
+    }
+  });
+
+  // Get conversation history
+  socket.on("get-conversation", (data) => {
+    const { recipientId } = data;
+    const currentUser = users.get(socket.id);
+
+    if (currentUser) {
+      const conversationKey = [currentUser.id, recipientId].sort().join("-");
+      const conversationMessages = messages.get(conversationKey) || [];
+
+      socket.emit("conversation-history", {
+        recipientId,
+        messages: conversationMessages,
+      });
+    }
+  });
+
+  // Handle disconnect
+  socket.on("disconnect", () => {
+    const user = users.get(socket.id);
+    if (user) {
+      // Update user status to offline
+      user.isOnline = false;
+      user.lastSeen = new Date();
+
+      // Remove from users map after a delay
+      setTimeout(() => {
+        users.delete(socket.id);
+        io.emit("users-updated", Array.from(users.values()));
+      }, 5000);
+
+      // Immediately update users list with offline status
+      io.emit("users-updated", Array.from(users.values()));
+
+      console.log(`${user.username} disconnected`);
     }
   });
 });
 
 const PORT = process.env.PORT || 8000;
 server.listen(PORT, () => {
-  console.log(`WebSocket server running on port ${PORT}`);
+  console.log(`Socket.IO server running on port ${PORT}`);
 });
